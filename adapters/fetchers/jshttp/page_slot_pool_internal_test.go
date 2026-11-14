@@ -11,6 +11,11 @@ import (
 
 type fakeSlotFactory struct {
 	created atomic.Int64
+	pinned  *AuthProxy
+}
+
+func (f *fakeSlotFactory) setPinned(authProxy *AuthProxy) {
+	f.pinned = authProxy
 }
 
 func (f *fakeSlotFactory) newSlot() (*pageSlot, error) {

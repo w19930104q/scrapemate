@@ -3,6 +3,8 @@ package jshttp
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mxschmitt/playwright-go"
@@ -98,22 +100,27 @@ func New(params JSFetcherOptions) (scrapemate.HTTPFetcher, error) {
 	}
 
 	if maxPagesPerBrowser > 1 {
+		slotFactory := &playwrightSlotFactory{
+			pw:            pw,
+			headless:      params.Headless,
+			disableImages: params.DisableImages,
+			proxyPool:     pool,
+			ua:            params.UserAgent,
+		}
+
 		ans.pageSlots, err = newPageSlotPool(pageSlotPoolConfig{
 			poolSize:           params.PoolSize,
 			maxPagesPerBrowser: maxPagesPerBrowser,
-			factory: playwrightSlotFactory{
-				pw:            pw,
-				headless:      params.Headless,
-				disableImages: params.DisableImages,
-				proxyPool:     pool,
-				ua:            params.UserAgent,
-			},
+			factory:            slotFactory,
 		})
 		if err != nil {
 			_ = ans.Close()
 
 			return nil, err
 		}
+
+		ans.pageSlotFactory = slotFactory
+		ans.poolSize = params.PoolSize
 
 		return &ans, nil
 	}
@@ -128,9 +135,14 @@ func New(params JSFetcherOptions) (scrapemate.HTTPFetcher, error) {
 		ua:            params.UserAgent,
 	}
 	ans.factory = sessionFactory
+	ans.poolSize = params.PoolSize
+	ans.allSlots = make([]*sessionSlot, 0, params.PoolSize)
 
 	for range params.PoolSize {
-		ans.slots <- newSessionSlot(sessionFactory)
+		slot := newSessionSlot(sessionFactory)
+		ans.allSlots = append(ans.allSlots, slot)
+
+		ans.slots <- slot
 	}
 
 	return &ans, nil
@@ -146,10 +158,17 @@ type jsFetch struct {
 	proxyPool         *ProxyPool
 	factory           runtimeFactory
 	slots             chan *sessionSlot
-	pageSlots         *pageSlotPool
+	// allSlots holds every session slot, including the ones currently
+	// acquired by in-flight requests, so RefreshProxy can mark them all stale.
+	allSlots        []*sessionSlot
+	pageSlots       *pageSlotPool
+	pageSlotFactory pageSlotFactory
+	poolSize        int
 
 	rotator            scrapemate.ProxyRotator
 	maxPagesPerBrowser int
+
+	rebindMu sync.Mutex
 }
 
 func (o *jsFetch) getSlot(ctx context.Context) (*sessionSlot, error) {
@@ -183,6 +202,99 @@ func (o *jsFetch) Close() error {
 	}
 
 	_ = o.pw.Stop()
+
+	return nil
+}
+
+// pinnableFactory is implemented by browser factories that can pin every
+// browser they create afterwards to a specific local proxy. It is the seam
+// used by RefreshProxy to rebuild sessions bound to the proxy selected by
+// scrapemate's rotator.
+type pinnableFactory interface {
+	setPinned(*AuthProxy)
+}
+
+// RefreshProxy rebinds the fetcher to the local AuthProxy that serves proxy so
+// that the next Fetch really runs through a different upstream IP.
+//
+// Playwright binds the proxy at browser launch time, so running browsers
+// cannot be switched in place. The browser factory is pinned to the selected
+// proxy and the existing sessions are marked stale (or, in the multi-page
+// pool mode, the pool is rebuilt); the next request then runs on a browser
+// launched through the new proxy. It implements
+// scrapemate.ProxyRefreshableFetcher.
+func (o *jsFetch) RefreshProxy(ctx context.Context, proxy scrapemate.Proxy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if o.proxyPool == nil {
+		return errors.New("cannot refresh proxy: no proxy pool is configured")
+	}
+
+	authProxy, ok := o.proxyPool.Get(proxy.FullURL())
+	if !ok {
+		return fmt.Errorf("proxy %s is not part of the fetcher's proxy pool", proxy.FullURL())
+	}
+
+	o.rebindMu.Lock()
+	defer o.rebindMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if o.maxPagesPerBrowser > 1 {
+		return o.rebindPageSlotPool(ctx, authProxy)
+	}
+
+	return o.rebindSessionSlots(ctx, authProxy)
+}
+
+// rebindSessionSlots pins the runtime factory to authProxy and marks every
+// slot stale. Idle slots rebuild their browser on their next acquirePage;
+// slots held by in-flight requests keep serving the current request and
+// rebuild on the next one, so this never blocks on a busy worker.
+func (o *jsFetch) rebindSessionSlots(_ context.Context, authProxy *AuthProxy) error {
+	if f, ok := o.factory.(pinnableFactory); ok {
+		f.setPinned(authProxy)
+	}
+
+	for _, slot := range o.allSlots {
+		slot.markStale()
+	}
+
+	return nil
+}
+
+// rebindPageSlotPool closes the current browser pool (each browser keeps the
+// proxy it was launched with) and builds a new one whose factory is pinned to
+// authProxy.
+func (o *jsFetch) rebindPageSlotPool(ctx context.Context, authProxy *AuthProxy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	f, ok := o.pageSlotFactory.(pinnableFactory)
+	if !ok {
+		return errors.New("page slot factory does not support proxy pinning")
+	}
+
+	f.setPinned(authProxy)
+
+	pool, err := newPageSlotPool(pageSlotPoolConfig{
+		poolSize:           o.poolSize,
+		maxPagesPerBrowser: o.maxPagesPerBrowser,
+		factory:            o.pageSlotFactory,
+	})
+	if err != nil {
+		return err
+	}
+
+	old := o.pageSlots
+	o.pageSlots = pool
+
+	old.close()
 
 	return nil
 }
@@ -289,7 +401,7 @@ func (o *browser) Close() {
 	_ = o.browser.Close()
 }
 
-func newBrowser(pw *playwright.Playwright, headless, disableImages bool, proxyPool *ProxyPool, ua string) (*browser, error) {
+func newBrowser(pw *playwright.Playwright, headless, disableImages bool, authProxy *AuthProxy, ua string) (*browser, error) {
 	opts := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(headless),
 		Args: []string{
@@ -343,13 +455,9 @@ func newBrowser(pw *playwright.Playwright, headless, disableImages bool, proxyPo
 			Height: defaultHeight,
 		},
 		Proxy: func() *playwright.Proxy {
-			if proxyPool != nil {
-				authProxy := proxyPool.Next()
-
-				addr := authProxy.Address()
-
+			if authProxy != nil {
 				return &playwright.Proxy{
-					Server: addr,
+					Server: authProxy.Address(),
 				}
 			}
 

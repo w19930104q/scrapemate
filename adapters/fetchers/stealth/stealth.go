@@ -18,7 +18,11 @@ type proxyFetcher interface {
 type stealthFetch struct {
 	browserSettings settings
 	rotator         proxyFetcher
+	pinnedMu        sync.Mutex
+	pinned          *scrapemate.Proxy
 }
+
+var _ scrapemate.ProxyRefreshableFetcher = (*stealthFetch)(nil)
 
 func New(browser string, rotator proxyFetcher) scrapemate.HTTPFetcher {
 	ans := stealthFetch{}
@@ -32,6 +36,19 @@ func New(browser string, rotator proxyFetcher) scrapemate.HTTPFetcher {
 	}
 
 	return &ans
+}
+
+// RefreshProxy pins the next Fetch call to proxy. It implements
+// scrapemate.ProxyRefreshableFetcher and is used by the RefreshIP retry
+// policy. The pin is consumed by the next request.
+func (o *stealthFetch) RefreshProxy(_ context.Context, proxy scrapemate.Proxy) error {
+	o.pinnedMu.Lock()
+	defer o.pinnedMu.Unlock()
+
+	pinned := proxy
+	o.pinned = &pinned
+
+	return nil
 }
 
 func (o *stealthFetch) Close() error {
@@ -54,7 +71,17 @@ func (o *stealthFetch) Fetch(ctx context.Context, job scrapemate.IJob) scrapemat
 	if o.rotator != nil {
 		session.InsecureSkipVerify = true
 
-		proxy := o.rotator.Next()
+		o.pinnedMu.Lock()
+		pinned := o.pinned
+		o.pinned = nil
+		o.pinnedMu.Unlock()
+
+		var proxy scrapemate.Proxy
+		if pinned != nil {
+			proxy = *pinned
+		} else {
+			proxy = o.rotator.Next()
+		}
 
 		if err := session.SetProxy(proxy.FullURL()); err != nil {
 			return scrapemate.Response{

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `RefreshIP` retry policy is now implemented. Before each retry the configured
+  `ProxyRotator` (via the new `scrapemate.WithProxyRotator` option, wired
+  automatically by `scrapemateapp.WithProxies`) advances to the next available
+  proxy and the fetcher is rebound so the retry actually uses it: the js
+  fetcher rebuilds the browser session bound to the new proxy, while the
+  nethttp and stealth fetchers pin their next request to it. Retries keep the
+  exponential backoff capped by `MaxRetryDelay`, and both the wait and the
+  rebind respect context cancellation. With no rotator (or no proxies) the
+  policy degrades to a plain delayed retry and logs a warning; `RetryJob` and
+  `DiscardJob` behaviour is unchanged.
 - `RequestHookProvider` — optional capability interface for `BrowserPage`
   implementations that can intercept outgoing requests and responses. Consumers
   opt in via a type assertion (`if hook, ok := page.(scrapemate.RequestHookProvider); ok { ... }`),

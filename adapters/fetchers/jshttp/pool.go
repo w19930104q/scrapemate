@@ -9,6 +9,11 @@ import (
 type ProxyPool struct {
 	current int
 	mu      *sync.Mutex
+	// urls holds the full proxy URLs (scrapemate.Proxy.FullURL() values) the
+	// pool was created with, in the same order as proxies. It allows looking
+	// up the local AuthProxy that corresponds to a proxy selected by
+	// scrapemate's rotator.
+	urls    []string
 	proxies []*AuthProxy
 }
 
@@ -19,6 +24,7 @@ func NewProxyPool(proxies []string) (*ProxyPool, error) {
 
 	pool := &ProxyPool{
 		mu:      &sync.Mutex{},
+		urls:    make([]string, 0, len(proxies)),
 		proxies: make([]*AuthProxy, 0, len(proxies)),
 	}
 
@@ -33,6 +39,7 @@ func NewProxyPool(proxies []string) (*ProxyPool, error) {
 			return nil, fmt.Errorf("failed to start auth proxy for %s: %w", p, err)
 		}
 
+		pool.urls = append(pool.urls, p)
 		pool.proxies = append(pool.proxies, authProxy)
 	}
 
@@ -47,6 +54,23 @@ func (pp *ProxyPool) Next() *AuthProxy {
 	pp.current++
 
 	return p
+}
+
+// Get returns the local AuthProxy that serves the upstream proxy identified by
+// fullURL (a scrapemate.Proxy.FullURL() value). It is used when the
+// RefreshIP retry policy asks the fetcher to bind the next request to the
+// proxy selected by scrapemate's rotator.
+func (pp *ProxyPool) Get(fullURL string) (*AuthProxy, bool) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+
+	for i, u := range pp.urls {
+		if u == fullURL {
+			return pp.proxies[i], true
+		}
+	}
+
+	return nil, false
 }
 
 type proxyConfig struct {

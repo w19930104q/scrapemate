@@ -3,6 +3,7 @@ package jshttp
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/mxschmitt/playwright-go"
 )
@@ -31,10 +32,40 @@ type runtimeFactory interface {
 type sessionSlot struct {
 	factory runtimeFactory
 	runtime slotRuntime
+	// stale marks a slot whose browser was launched with an outdated proxy.
+	// It is set by RefreshProxy, possibly while the slot is busy; the next
+	// acquirePage closes the old browser and lazily creates one through the
+	// factory's currently pinned proxy.
+	staleMu sync.Mutex
+	stale   bool
 }
 
 func newSessionSlot(factory runtimeFactory) *sessionSlot {
 	return &sessionSlot{factory: factory}
+}
+
+// markStale flags the slot so its next acquirePage rebuilds the browser. It
+// never blocks on an in-flight request and does not interrupt the browser that
+// is currently serving one.
+func (s *sessionSlot) markStale() {
+	s.staleMu.Lock()
+	defer s.staleMu.Unlock()
+
+	s.stale = true
+}
+
+func (s *sessionSlot) isStale() bool {
+	s.staleMu.Lock()
+	defer s.staleMu.Unlock()
+
+	return s.stale
+}
+
+func (s *sessionSlot) clearStale() {
+	s.staleMu.Lock()
+	defer s.staleMu.Unlock()
+
+	s.stale = false
 }
 
 func (s *sessionSlot) ensureReady(ctx context.Context) error {
@@ -69,6 +100,19 @@ func (s *sessionSlot) close() error {
 }
 
 func (s *sessionSlot) acquirePage(ctx context.Context) (page, error) {
+	if s.isStale() {
+		if s.runtime != nil {
+			if err := s.runtime.closeBrowser(); err != nil {
+				return nil, err
+			}
+		}
+
+		// drop the old browser so ensureReady creates one through the
+		// factory's currently pinned proxy
+		s.runtime = nil
+		s.clearStale()
+	}
+
 	if err := s.ensureReady(ctx); err != nil {
 		return nil, err
 	}
@@ -101,10 +145,40 @@ type playwrightRuntimeFactory struct {
 	disableImages bool
 	proxyPool     *ProxyPool
 	ua            string
+	pinned        *AuthProxy
+	mu            sync.Mutex
+}
+
+var _ pinnableFactory = (*playwrightRuntimeFactory)(nil)
+
+// setPinned pins every browser created afterwards to authProxy. A nil value
+// restores round robin selection from the proxy pool.
+func (f *playwrightRuntimeFactory) setPinned(authProxy *AuthProxy) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.pinned = authProxy
+}
+
+func (f *playwrightRuntimeFactory) selectedProxy() *AuthProxy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.pinned != nil {
+		return f.pinned
+	}
+
+	if f.proxyPool != nil {
+		return f.proxyPool.Next()
+	}
+
+	return nil
 }
 
 func (f *playwrightRuntimeFactory) create(context.Context) (slotRuntime, error) {
-	b, err := newBrowser(f.pw, f.headless, f.disableImages, f.proxyPool, f.ua)
+	authProxy := f.selectedProxy()
+
+	b, err := newBrowser(f.pw, f.headless, f.disableImages, authProxy, f.ua)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +190,7 @@ func (f *playwrightRuntimeFactory) create(context.Context) (slotRuntime, error) 
 		disableImages: f.disableImages,
 		proxyPool:     f.proxyPool,
 		ua:            f.ua,
+		pinned:        authProxy,
 	}, nil
 }
 
@@ -126,6 +201,19 @@ type playwrightRuntime struct {
 	disableImages bool
 	proxyPool     *ProxyPool
 	ua            string
+	pinned        *AuthProxy
+}
+
+func (r *playwrightRuntime) selectedProxy() *AuthProxy {
+	if r.pinned != nil {
+		return r.pinned
+	}
+
+	if r.proxyPool != nil {
+		return r.proxyPool.Next()
+	}
+
+	return nil
 }
 
 func (r *playwrightRuntime) pageCount() int {
@@ -194,7 +282,7 @@ func (r *playwrightRuntime) recreateContext() error {
 func (r *playwrightRuntime) recreateBrowser() error {
 	r.browser.Close()
 
-	b, err := newBrowser(r.pw, r.headless, r.disableImages, r.proxyPool, r.ua)
+	b, err := newBrowser(r.pw, r.headless, r.disableImages, r.selectedProxy(), r.ua)
 	if err != nil {
 		return err
 	}

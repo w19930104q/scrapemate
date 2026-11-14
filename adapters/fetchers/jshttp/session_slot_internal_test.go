@@ -99,10 +99,18 @@ func (p *fakePage) isClosed() bool { return p.closed }
 type fakeRuntimeFactory struct {
 	browserCreations int
 	pageTotal        int
+	pinned           *AuthProxy
+	closeCount       int
 }
+
+var _ pinnableFactory = (*fakeRuntimeFactory)(nil)
 
 func newFakeRuntimeFactoryWithPages(total int) *fakeRuntimeFactory {
 	return &fakeRuntimeFactory{pageTotal: total}
+}
+
+func (f *fakeRuntimeFactory) setPinned(authProxy *AuthProxy) {
+	f.pinned = authProxy
 }
 
 func (f *fakeRuntimeFactory) create(context.Context) (slotRuntime, error) {
@@ -118,12 +126,13 @@ func (f *fakeRuntimeFactory) create(context.Context) (slotRuntime, error) {
 		pages[i] = &fakePage{id: i + 1}
 	}
 
-	return &fakeRuntime{pages: pages, nextPageID: total + 1}, nil
+	return &fakeRuntime{pages: pages, nextPageID: total + 1, factory: f}, nil
 }
 
 type fakeRuntime struct {
 	pages      []*fakePage
 	nextPageID int
+	factory    *fakeRuntimeFactory
 }
 
 func (f *fakeRuntime) pageCount() int { return len(f.pages) }
@@ -136,7 +145,10 @@ func (f *fakeRuntime) closeExtraPages() error {
 	return nil
 }
 
-func (f *fakeRuntime) closeBrowser() error { return nil }
+func (f *fakeRuntime) closeBrowser() error {
+	f.factory.closeCount++
+	return nil
+}
 
 func (f *fakeRuntime) primaryPage() (page, error) {
 	if len(f.pages) == 0 {

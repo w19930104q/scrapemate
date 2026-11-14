@@ -24,6 +24,16 @@ type HTTPFetcher interface {
 	Close() error
 }
 
+// ProxyRefreshableFetcher is implemented by fetchers that can bind the next
+// request to a specific proxy. When a job uses the RefreshIP retry policy and
+// a ProxyRotator is configured, scrapemate calls RefreshProxy with the proxy
+// returned by the rotator before each retry. The fetcher must then make sure
+// that the subsequent Fetch call really uses that proxy (e.g. by rebuilding or
+// rebinding its underlying session).
+type ProxyRefreshableFetcher interface {
+	RefreshProxy(ctx context.Context, proxy Proxy) error
+}
+
 // HTMLParser is an interface for html parsers
 //
 //go:generate mockgen -destination=mock/mock_parser.go -package=mock . HTMLParser

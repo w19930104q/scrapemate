@@ -163,6 +163,23 @@ func WithCache(cache Cacher) func(*ScrapeMate) error {
 	}
 }
 
+// WithProxyRotator sets the proxy rotator for the scrapemate.
+// It is only used by jobs whose retry policy is RefreshIP: before each such
+// retry the rotator advances to the next available proxy and the fetcher (when
+// it implements ProxyRefreshableFetcher) is rebound to that proxy. Without a
+// rotator, RefreshIP jobs fall back to a plain delayed retry.
+func WithProxyRotator(rotator ProxyRotator) func(*ScrapeMate) error {
+	return func(s *ScrapeMate) error {
+		if rotator == nil {
+			return errors.New("proxy rotator is nil")
+		}
+
+		s.proxyRotator = rotator
+
+		return nil
+	}
+}
+
 // WithInitJob sets the first job to be processed
 // It will be processed before the jobs from the job provider
 // It is useful if you want to start the scraper with a specific job
@@ -180,17 +197,18 @@ func WithInitJob(job IJob) func(*ScrapeMate) error {
 
 // Scrapemate contains unexporter fields
 type ScrapeMate struct {
-	log         logging.Logger
-	ctx         context.Context
-	cancelFn    context.CancelCauseFunc
-	jobProvider JobProvider
-	concurrency int
-	httpFetcher HTTPFetcher
-	htmlParser  HTMLParser
-	cache       Cacher
-	results     chan Result
-	failedJobs  chan IJob
-	initJob     IJob
+	log          logging.Logger
+	ctx          context.Context
+	cancelFn     context.CancelCauseFunc
+	jobProvider  JobProvider
+	concurrency  int
+	httpFetcher  HTTPFetcher
+	htmlParser   HTMLParser
+	cache        Cacher
+	proxyRotator ProxyRotator
+	results      chan Result
+	failedJobs   chan IJob
+	initJob      IJob
 
 	stats                    stats
 	exitOnInactivity         bool
@@ -440,15 +458,102 @@ func (s *ScrapeMate) doFetch(ctx context.Context, job IJob) (ans Response) {
 
 		switch retryPolicy {
 		case RetryJob:
-			time.Sleep(delay)
+			if !s.waitRetryDelay(ctx, job, delay) {
+				return ans
+			}
 
 			if delay > job.GetMaxRetryDelay() {
 				delay = job.GetMaxRetryDelay()
 			} else {
 				delay *= 2
 			}
-		case RefreshIP: // TODO Implement
+		case RefreshIP:
+			if !s.waitRetryDelay(ctx, job, delay) {
+				return ans
+			}
+
+			delay = nextBackoff(delay, job.GetMaxRetryDelay())
+
+			s.refreshProxy(ctx, job)
 		}
+	}
+}
+
+// waitRetryDelay waits for d while respecting the context cancellation.
+// It returns true when the whole delay elapsed and false when the context was
+// cancelled first, in which case the retry loop must stop and return the last
+// response.
+func (s *ScrapeMate) waitRetryDelay(ctx context.Context, job IJob, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		s.log.Warn("retry wait interrupted by context cancellation", "job", job, "error", ctx.Err())
+
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// nextBackoff returns the exponential backoff delay to wait before the next
+// retry. The delay doubles on every retry and is capped by maxDelay.
+func nextBackoff(current, maxDelay time.Duration) time.Duration {
+	if current >= maxDelay {
+		return maxDelay
+	}
+
+	next := current * 2
+	if next > maxDelay || next <= 0 {
+		return maxDelay
+	}
+
+	return next
+}
+
+// refreshProxy advances the proxy rotator to the next available proxy and
+// rebinds the fetcher (when supported) so that the next Fetch uses the new
+// proxy. When no rotator is configured, or the rotator has no proxies, the
+// RefreshIP policy degrades gracefully to a plain delayed retry and the event
+// is logged.
+func (s *ScrapeMate) refreshProxy(ctx context.Context, job IJob) {
+	if s.proxyRotator == nil {
+		s.log.Warn("RefreshIP requested but no proxy rotator is configured; retrying with the same address",
+			"job", job)
+
+		return
+	}
+
+	if proxies := s.proxyRotator.Proxies(); len(proxies) == 0 {
+		s.log.Warn("RefreshIP requested but the proxy rotator has no proxies; retrying with the same address",
+			"job", job)
+
+		return
+	}
+
+	next := s.proxyRotator.Next()
+
+	s.log.Info("rotating proxy before retry", "job", job, "proxy", next.FullURL())
+
+	rebinder, supported := s.httpFetcher.(ProxyRefreshableFetcher)
+	if !supported {
+		s.log.Warn("http fetcher does not support proxy rebinding; the new proxy may not be used for this retry",
+			"job", job, "proxy", next.FullURL())
+
+		return
+	}
+
+	if err := rebinder.RefreshProxy(ctx, next); err != nil {
+		if ctx.Err() != nil {
+			s.log.Warn("proxy rebind interrupted by context cancellation",
+				"job", job, "proxy", next.FullURL(), "error", err)
+
+			return
+		}
+
+		s.log.Error("error while rebinding fetcher to the new proxy",
+			"job", job, "proxy", next.FullURL(), "error", err)
 	}
 }
 

@@ -27,6 +27,7 @@ type ScrapemateApp struct {
 
 	provider scrapemate.JobProvider
 	cacher   scrapemate.Cacher
+	rotator  scrapemate.ProxyRotator
 }
 
 // NewScrapemateApp creates a new ScrapemateApp.
@@ -127,6 +128,10 @@ func (app *ScrapemateApp) getMate(ctx context.Context) (*scrapemate.ScrapeMate, 
 		params = append(params, scrapemate.WithInitJob(app.cfg.InitJob))
 	}
 
+	if app.rotator != nil {
+		params = append(params, scrapemate.WithProxyRotator(app.rotator))
+	}
+
 	return scrapemate.New(params...)
 }
 
@@ -157,6 +162,8 @@ func (app *ScrapemateApp) getFetcher() (scrapemate.HTTPFetcher, error) {
 		rotator = proxy.New(app.cfg.Proxies)
 	}
 
+	app.rotator = rotator
+
 	const timeout = 10 * time.Second
 
 	switch app.cfg.UseJS {
@@ -183,10 +190,10 @@ func (app *ScrapemateApp) getFetcher() (scrapemate.HTTPFetcher, error) {
 			}
 
 			if rotator != nil {
-				netClient.Transport = rotator
+				httpFetcher = fetcher.NewWithRotator(netClient, rotator)
+			} else {
+				httpFetcher = fetcher.New(netClient)
 			}
-
-			httpFetcher = fetcher.New(netClient)
 		}
 	}
 

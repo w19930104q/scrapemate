@@ -115,10 +115,39 @@ type playwrightSlotFactory struct {
 	disableImages bool
 	proxyPool     *ProxyPool
 	ua            string
+	pinned        *AuthProxy
+	mu            sync.Mutex
 }
 
-func (f playwrightSlotFactory) newSlot() (*pageSlot, error) {
-	b, err := newBrowser(f.pw, f.headless, f.disableImages, f.proxyPool, f.ua)
+var _ pinnableFactory = (*playwrightSlotFactory)(nil)
+
+// setPinned pins every slot created afterwards to authProxy. A nil value
+// restores round robin selection from the proxy pool.
+func (f *playwrightSlotFactory) setPinned(authProxy *AuthProxy) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.pinned = authProxy
+}
+
+func (f *playwrightSlotFactory) selectedProxy() *AuthProxy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.pinned != nil {
+		return f.pinned
+	}
+
+	if f.proxyPool != nil {
+		return f.proxyPool.Next()
+	}
+
+	return nil
+}
+
+// newSlot implements pageSlotFactory.
+func (f *playwrightSlotFactory) newSlot() (*pageSlot, error) {
+	b, err := newBrowser(f.pw, f.headless, f.disableImages, f.selectedProxy(), f.ua)
 	if err != nil {
 		return nil, err
 	}
